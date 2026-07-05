@@ -39,10 +39,14 @@ import numpy as np
 import requests
 from piper.voice import PiperVoice
 
+import victor_brain
+import victor_config as cfg
+import victor_ears
+import victor_memory
+
 # ─── Configuration ──────────────────────────────────────────────────────────────
 
-_JARVIS_ENV  = Path.home() / "Documentos/Proyectos/jarvis-ironman/.env"
-PIPER_MODEL  = str(Path.home() / "Documentos/Proyectos/jarvis-ironman/voices/es_davefx_medium/model.onnx")
+PIPER_MODEL  = str(cfg.PIPER_MODEL_PATH)
 _AC_BRIDGE_DIR = Path.home() / ".local/share/Steam/steamapps/common/assettocorsa/apps/python/ACEngineer"
 _ENGINEER_DIR  = Path(__file__).parent.resolve()
 # SHM reader (ac_shm_reader.exe via Wine) writes next to the exe — always writable
@@ -54,27 +58,17 @@ TELEM_SLOW_BRIDGE = str(_AC_BRIDGE_DIR / "ac_telemetry_slow.json")
 # Active paths — resolved at runtime in the telemetry loop
 TELEM_FAST   = TELEM_FAST_SHM
 TELEM_SLOW   = TELEM_SLOW_SHM
-GROQ_MODEL   = "llama-3.3-70b-versatile"
 
-
-def _load_dotenv(p: Path) -> dict:
-    env: dict = {}
-    try:
-        for line in p.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    except Exception:
-        pass
-    return env
-
-_env = _load_dotenv(_JARVIS_ENV)
-GROQ_API_KEY = os.getenv("JARVIS_GROQ_API_KEY") or _env.get("JARVIS_GROQ_API_KEY", "")
+# Cerebro multi-backend (Groq → Cerebras → NVIDIA → Gemini) — reemplaza al Groq-only
+# de v6. Sin Ollama a propósito: Victor solo corre durante juegos, y el modelo local
+# consume ~5GB de VRAM que ya casi se agota con el juego + stack gráfico (ver
+# incidente de freeze del 2026-07-03 en la memoria de NEXUS).
+_brain = victor_brain.VictorBrain()
+GROQ_API_KEY = cfg.GROQ_API_KEY  # usado solo para el chequeo de warning en main()
 
 # Audio
 SAMPLE_RATE      = 16000
-CHUNK_FRAMES     = 1024
+CHUNK_FRAMES     = 512        # = frame nativo de Silero VAD v5 (32ms @ 16kHz)
 VOICE_AMP_MIN    = 500        # minimum RMS to start recording (floor for calibration)
 SILENCE_AMP_MIN  = 90         # minimum RMS for silence detection (floor for calibration)
 SILENCE_SECS     = 2.0        # silence duration before stopping recording
@@ -1143,61 +1137,22 @@ def _ctx() -> str:
 
 
 def _groq(user_msg: str, max_tokens: int = 110) -> str:
-    if not GROQ_API_KEY:
-        return ""
     # BUG FIX: snapshot convo under lock to avoid race between concurrent LLM threads
     with _convo_lock:
         messages = list(_convo) + [{"role": "user", "content": user_msg}]
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "system", "content": _SYSTEM}] + messages,
-                "max_tokens": max_tokens, "temperature": 0.3,
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"].strip()
-        with _convo_lock:
-            _convo.append({"role": "user", "content": user_msg})
-            _convo.append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        print(f"[Groq] {e}")
+    reply = _brain.complete(_SYSTEM, messages, max_tokens=max_tokens)
+    if not reply:
+        print(f"[Brain] Todos los backends caídos ({_brain.status()})")
         return ""
+    with _convo_lock:
+        _convo.append({"role": "user", "content": user_msg})
+        _convo.append({"role": "assistant", "content": reply})
+    return reply
 
 # ─── STT ─────────────────────────────────────────────────────────────────────────
 
 def _transcribe(wav_path: str) -> str:
-    if not GROQ_API_KEY:
-        return ""
-    try:
-        with open(wav_path, "rb") as f:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": ("rec.wav", f, "audio/wav")},
-                data={"model": "whisper-large-v3", "language": "es", "response_format": "verbose_json"},
-                timeout=15,
-            )
-        r.raise_for_status()
-        data = r.json()
-        text = data.get("text", "").strip()
-        # Reject hallucinations: Whisper generates plausible phrases from background noise
-        segments = data.get("segments", [])
-        if segments:
-            no_speech = max(s.get("no_speech_prob", 0) for s in segments)
-            avg_logprob = sum(s.get("avg_logprob", 0) for s in segments) / len(segments)
-            if no_speech > 0.35 or avg_logprob < -0.5:
-                print(f"[STT] Rechazado (no_speech={no_speech:.2f} logprob={avg_logprob:.2f}): {text!r}")
-                return ""
-        return text
-    except Exception as e:
-        print(f"[STT] {e}")
-        return ""
+    return victor_brain.transcribe(wav_path)
 
 # ─── TTS ─────────────────────────────────────────────────────────────────────────
 
@@ -1852,9 +1807,11 @@ def _session_briefing(t: Telemetry):
             fuel_loaded=t.fuel, tyre_compound=t.tyre_compound,
             time_left=t.time_left, track_len_m=t.track_len,
         )
+        mem_ctx = victor_memory.context_block(t.track, t.car)
         prompt = (
-            f"PRE-CARRERA:\n{setup_ctx}\n\n"
-            f"En EXACTAMENTE 2 oraciones, da:\n"
+            f"PRE-CARRERA:\n{setup_ctx}\n"
+            + (f"\n{mem_ctx}\n" if mem_ctx else "\n")
+            + f"En EXACTAMENTE 2 oraciones, da:\n"
             f"1) Ajuste específico de alerón trasero + presiones de neumáticos para esta combinación coche-pista.\n"
             f"2) Si el combustible cargado es suficiente y si el compuesto es el correcto para la pista."
         )
@@ -2009,6 +1966,12 @@ def _post_race_debrief(t: Telemetry, laps: list):
     if r:
         _say(f"Debrief de carrera. {r}")
 
+    victor_memory.record_debrief(
+        t.track, t.car, best_lap_ms=best_lap_ms,
+        worst_zone_label=_zone_label_for(t.track, zone_d[0][1]) if zone_d else "",
+        debrief_note=r[:200] if r else "",
+    )
+
 # ─── Voice command processor ─────────────────────────────────────────────────────
 
 _MUTE_KW     = {"cállate","silencio","para","basta","quiet","callate"}
@@ -2151,8 +2114,33 @@ def _handle_voice(wav_path: str):
 _PREFER_MIC = ("jbl", "headset", "headphone", "auricular", "bluetooth", "microphone", "mic",
                "cavs",       # Raptor Lake cAVS — real HDA hardware mic/headphone jack
                )
+def _build_speech_gate() -> Optional["victor_ears.SpeechGate"]:
+    """Carga Silero VAD + calibración aprendida por tools/teach_victor.py.
+    Si el modelo no está disponible, devuelve None — el llamador debe caer al
+    gate por amplitud de v6 en vez de dejar a Victor sordo."""
+    try:
+        cal = cfg.load_calibration()
+        vad = victor_ears.SileroVad(cfg.SILERO_VAD_PATH)
+        return victor_ears.SpeechGate(
+            vad,
+            vad_threshold=cal["vad_threshold"],
+            vad_end_threshold=cal["vad_end_threshold"],
+            confirm_frames=cal["vad_confirm_frames"],
+            rms_prefilter=cal["rms_prefilter"],
+            silence_frames=int(SILENCE_SECS * SAMPLE_RATE / CHUNK_FRAMES),
+            max_frames=int(MAX_REC_SECS * SAMPLE_RATE / CHUNK_FRAMES),
+        )
+    except Exception as e:
+        print(f"[Mic] Silero VAD no disponible ({e}) — cae a gate por amplitud v6.")
+        return None
+
+
 def _audio_worker():
-    """Capture audio via arecord subprocess — avoids PyAudio/PipeWire hanging when AC runs."""
+    """Capture audio via arecord subprocess — avoids PyAudio/PipeWire hanging when AC runs.
+    Gate real (Silero VAD, ver victor_ears.py) en vez del umbral de amplitud de v6:
+    el ruido de motor/tráfico es de banda ancha y alta amplitud, así que un gate por
+    RMS puro grababa ruido en vez de voz. Silero mira la ESTRUCTURA espectral de voz
+    humana — el motor queda por debajo del umbral aunque su RMS sea alto."""
     import subprocess as _sp
 
     # Wait for startup TTS to finish
@@ -2166,13 +2154,18 @@ def _audio_worker():
     time.sleep(0.5)
 
     RATE       = SAMPLE_RATE          # 16000 Hz
-    CHANNELS   = 1
-    CHUNK_B    = CHUNK_FRAMES * 2     # 2 bytes per int16 sample
+    CHUNK_B    = CHUNK_FRAMES * 2      # 2 bytes per int16 sample
     SAMPLE_W   = 2
     ARECORD_CMD = ["arecord", "-D", "default", "-f", "S16_LE",
                    "-r", str(RATE), "-c", "1", "-t", "raw", "-"]
 
-    print(f"[Mic] arecord @ {RATE}Hz mono (PipeWire default)")
+    gate = _build_speech_gate()
+    print(f"[Mic] arecord @ {RATE}Hz mono (PipeWire default) — "
+          f"gate: {'Silero VAD' if gate else 'amplitud (fallback)'}")
+
+    # Fallback legacy (solo si Silero no cargó) — mismo comportamiento que v6.
+    voice_thresh   = VOICE_AMP_MIN
+    silence_thresh = SILENCE_AMP_MIN
 
     while True:
         try:
@@ -2182,20 +2175,23 @@ def _audio_worker():
             time.sleep(10)
             continue
 
-        # Calibrate noise floor (0.5 s)
-        cal_chunks = max(1, int(0.5 * RATE / CHUNK_FRAMES))
-        cal_rms = []
-        for _ in range(cal_chunks):
-            raw = proc.stdout.read(CHUNK_B)
-            if not raw:
-                break
-            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-            cal_rms.append(float(np.sqrt(np.mean(arr ** 2))))
-        noise_floor    = float(np.mean(cal_rms)) if cal_rms else 80.0
-        voice_thresh   = max(VOICE_AMP_MIN,   noise_floor * 4.0)
-        silence_thresh = max(SILENCE_AMP_MIN, noise_floor * 1.8)
-        print(f"[Mic] Listo (arecord). Ruido base: {noise_floor:.0f} RMS → "
-              f"voz≥{voice_thresh:.0f} silencio<{silence_thresh:.0f}")
+        if gate is None:
+            # Calibrate noise floor (0.5 s) — solo en modo fallback
+            cal_chunks = max(1, int(0.5 * RATE / CHUNK_FRAMES))
+            cal_rms = []
+            for _ in range(cal_chunks):
+                raw = proc.stdout.read(CHUNK_B)
+                if not raw:
+                    break
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                cal_rms.append(float(np.sqrt(np.mean(arr ** 2))))
+            noise_floor    = float(np.mean(cal_rms)) if cal_rms else 80.0
+            voice_thresh   = max(VOICE_AMP_MIN,   noise_floor * 4.0)
+            silence_thresh = max(SILENCE_AMP_MIN, noise_floor * 1.8)
+            print(f"[Mic] Ruido base: {noise_floor:.0f} RMS → "
+                  f"voz≥{voice_thresh:.0f} silencio<{silence_thresh:.0f}")
+        else:
+            gate.reset()
 
         pre: deque[bytes]  = deque(maxlen=PRE_CHUNKS)
         frames: list[bytes] = []
@@ -2209,13 +2205,39 @@ def _audio_worker():
                 if not raw or len(raw) < CHUNK_B:
                     raise IOError("arecord stream ended")
 
+                since_tts = time.time() - _tts_finished_at
+                muted_now = _tts_busy.is_set() or since_tts < TTS_MIC_SUPPRESS  # anti-eco de la propia voz
+
+                if gate is not None:
+                    if muted_now:
+                        pre.append(raw)
+                        continue
+                    arr = np.frombuffer(raw, dtype=np.int16)
+                    event = gate.push(arr)
+                    if event == "start":
+                        frames = list(pre) + [raw]
+                        print("[Mic] Grabando (VAD)...", flush=True)
+                    elif event == "still_recording":
+                        frames.append(raw)
+                    elif event == "stop":
+                        frames.append(raw)
+                        if len(frames) * CHUNK_FRAMES / RATE >= 0.35:
+                            _save_wav(frames, SAMPLE_W, RATE)
+                        else:
+                            print("[Mic] Grabación muy corta, descartada.")
+                        frames = []
+                        pre.clear()
+                    else:
+                        pre.append(raw)
+                    continue
+
+                # ── Fallback legacy por amplitud (solo si Silero no cargó) ──
                 arr       = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
                 amp       = float(np.sqrt(np.mean(arr ** 2)))
-                since_tts = time.time() - _tts_finished_at
 
                 if not recording:
                     pre.append(raw)
-                    if amp >= voice_thresh and not _tts_busy.is_set() and since_tts >= TTS_MIC_SUPPRESS:
+                    if amp >= voice_thresh and not muted_now:
                         voice_run += 1
                         if voice_run >= MIN_VOICE_CHUNKS:
                             recording     = True
@@ -2269,12 +2291,14 @@ def _save_wav(frames: list[bytes], sw: int, rate: int = SAMPLE_RATE):
 def main():
     global _car_db, _pre_race_done, _audio_check_done, _race_finished
     print("=" * 60)
-    print("  VICTOR — AC Race Engineer v3")
-    print("  Pre-race | Spotter | Strategy | Damage | Voice")
+    print("  VICTOR — AC Race Engineer v7")
+    print("  Pre-race | Spotter | Strategy | Damage | Voice | Memoria")
     print("=" * 60)
 
-    if not GROQ_API_KEY:
-        print("[WARN] GROQ_API_KEY no encontrada — revisa .env de JARVIS.")
+    print(f"[Brain] Backends: {_brain.status()}")
+    if not any(b.available() for b in _brain.backends):
+        print("[WARN] Ningún backend de LLM tiene API key — revisa .env de NEXUS "
+              f"({cfg.NEXUS_ENV_PATH}).")
 
     print("[DB] Cargando base de datos de carros AC...", end=" ", flush=True)
     _car_db = _build_car_db()

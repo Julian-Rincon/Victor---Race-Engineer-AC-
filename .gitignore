@@ -3,3 +3,6 @@ __pycache__/
 ac_telemetry_*.json
 *.log
 nohup.out
+voices/
+models/
+data/
