@@ -39,6 +39,27 @@ _spawn_detached() {
   fi
 }
 
+# Mata por PID file cuando existe (solo la instancia que ESTE script lanzó);
+# recién si no hay PID file cae a pkill por nombre (huérfanos de antes de que
+# existiera este tracking, o crashes que no llegaron a escribirlo). Sin esto,
+# "stop" mataba por patrón de nombre sin importar de qué lanzamiento venía el
+# proceso — con dos instancias de Content Manager corriendo a la vez (ej. Steam
+# + una sesión de prueba vieja sin cerrar), cerrar una se llevaba puesto el
+# daemon de Victor de la OTRA.
+_stop_tracked() {
+  local pidfile="$1" label="$2" pattern="$3"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null && echo "[Victor] $label detenido (PID $pid)."
+    fi
+    rm -f "$pidfile"
+  elif pkill -f "$pattern" 2>/dev/null; then
+    echo "[Victor] $label detenido (sin PID file — huérfano de una instancia anterior)."
+  fi
+}
+
 case "${1:-tray}" in
   tray)
     echo "[Victor] Iniciando bandeja del sistema..."
@@ -49,9 +70,10 @@ case "${1:-tray}" in
     ;;
 
   start)
-    # Kill any lingering instances (from tray, CM hook, or previous sessions)
-    pkill -f "engineer\.py" 2>/dev/null && echo "[Victor] Deteniendo instancias anteriores..." || true
-    pkill -f "ac_shm_reader\.exe" 2>/dev/null && echo "[Victor] Deteniendo SHM reader anterior..." || true
+    # Detiene solo LA instancia que este script lanzó antes (por PID file) —
+    # no cualquier proceso con ese nombre en el sistema (ver _stop_tracked).
+    _stop_tracked "$PID_FILE" "Daemon anterior" "engineer\.py"
+    _stop_tracked "$SHM_PID_FILE" "SHM reader anterior" "ac_shm_reader\.exe"
     sleep 0.5
     rm -f "$ENGINEER_DIR"/ac_telemetry_fast.json \
           "$ENGINEER_DIR"/ac_telemetry_slow.json \
@@ -90,9 +112,8 @@ case "${1:-tray}" in
     ;;
 
   stop)
-    pkill -f "engineer\.py"     2>/dev/null && echo "[Victor] Daemon(s) detenido(s)." || echo "[Victor] Daemon no encontrado."
-    pkill -f "ac_shm_reader\.exe" 2>/dev/null && echo "[Victor] SHM reader detenido."  || true
-    rm -f "$PID_FILE" "$SHM_PID_FILE"
+    _stop_tracked "$PID_FILE" "Daemon" "engineer\.py"
+    _stop_tracked "$SHM_PID_FILE" "SHM reader" "ac_shm_reader\.exe"
     ;;
 
   stop-tray)
