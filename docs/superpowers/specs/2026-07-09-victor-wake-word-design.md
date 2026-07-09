@@ -36,7 +36,16 @@ adaptado a lo que Victor ya tiene, sin nuevas dependencias ni modelos.
 
 ## Diseño
 
-### `_has_wake_word(text) -> tuple[bool, str]` en `engineer.py`
+### `has_wake_word(text) -> tuple[bool, str]` en `victor_wake.py` (nuevo módulo)
+
+Módulo nuevo, no dentro de `engineer.py` — sigue el mismo patrón que
+`victor_ears.py`/`victor_memory.py`/`victor_brain.py`: pieza chica,
+sin efectos secundarios de importación, testeable con pytest limpio.
+Importar `engineer.py` directamente en tests no es viable — carga TTS/DB al
+importar, y los tests legacy (`test_v6_*.py`, `test_features.py`,
+`test_e2e_pipeline.py`) mockean `sys.modules['piper']` de forma global,
+contaminando el proceso si se mezclan con pytest (ver notas de v7 en
+memoria del proyecto). `engineer.py` solo importa y llama a la función.
 
 - Normaliza `text`: minúsculas, sin acentos (tabla de reemplazo simple,
   á/é/í/ó/ú/ü → a/e/i/o/u).
@@ -46,10 +55,15 @@ adaptado a lo que Victor ya tiene, sin nuevas dependencias ni modelos.
 - Para cada una de esas palabras, compara contra `"victor"` con
   `difflib.SequenceMatcher(None, palabra, "victor").ratio()`. Hay match si
   el ratio supera 0.75 **y** la diferencia de longitud contra "victor" (6
-  caracteres) es de a lo sumo 2. El guardia de longitud evita casos límite
-  donde una palabra que solo *empieza* como "victor" pero es claramente otra
-  cosa (ej. "victorioso", 10 caracteres) caiga justo en el borde del ratio
-  por coincidencia — sin el guardia, "victorioso" da ratio exactamente 0.75.
+  caracteres) es de a lo sumo 1. Valores medidos con `difflib` real (no
+  supuestos): "bictor"→0.833, "vitor"→0.909 (diff 1) — ambos pasan; pero
+  "victoria" da ratio 0.857 con diff 2, que con un guardia de 2 colaría como
+  falso positivo (es una palabra real, no un error de transcripción) — por
+  eso el guardia se ajustó a 1. "victorioso" (diff 4, ratio 0.750) queda
+  excluido por ambos lados. Trade-off aceptado y documentado: "vector"
+  (diff 0, ratio 0.833) pasaría el filtro si alguien lo dice de pasada —
+  no se persigue precisión perfecta, solo reducir falsos positivos de
+  música/ruido ambiente.
 - Devuelve `(True, texto_sin_wake_word)` si hay match — el texto resultante
   quita esa palabra para que el matching de keywords existente (`_MUTE_KW`,
   `_FUEL_KW`, etc.) siga funcionando igual sobre el resto de la frase.
@@ -63,9 +77,9 @@ text = _transcribe(wav_path)
 if not text or len(text.strip()) < 3:
     ...
 ```
-se agrega:
+se agrega (con `import victor_wake` al inicio del archivo):
 ```python
-has_wake, text = _has_wake_word(text)
+has_wake, text = victor_wake.has_wake_word(text)
 if not has_wake:
     print(f"[STT] Sin 'Victor' — ignorado: '{text}'")
     return
@@ -88,11 +102,12 @@ recibe el texto limpio.
 ## Testing
 
 - `test_v7_ears.py` no cambia (no se tocó `victor_ears.py`).
-- Nuevo: casos para `_has_wake_word` — "victor cállate" → True + "cállate";
-  "bictor cuanto combustible" → True (fuzzy); "hola como estas" → False;
-  frase vacía → False; "el victorioso ganó" → False (la palabra completa es
-  "victorioso", no "victor", el ratio de SequenceMatcher sobre la palabra
-  entera no debe pasar el umbral).
+- Nuevo `test_v7_wake.py` para `victor_wake.has_wake_word` — casos medidos
+  con `difflib` real: "victor cállate" → True, resto "cállate"; "bictor
+  cuanto combustible" → True, fuzzy (ratio 0.833); "vitor dame el gap" →
+  True, fuzzy (ratio 0.909, diff 1); "hola como estas" → False (ratio 0.2);
+  "el victorioso ganó" → False (diff 4, ratio 0.750, no supera el umbral);
+  frase vacía → False.
 
 ## Verificación en vivo
 
