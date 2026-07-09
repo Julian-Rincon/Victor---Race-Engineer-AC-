@@ -137,7 +137,7 @@ COOLDOWN: dict[str, float] = {
     "pit_window":   60.0, "session_brief": 999.0,
     "coaching":     60.0, "crash_reaction": 8.0,
     "dirty_move":   15.0, "midlap_proj":   35.0,
-    "off_track":    12.0, "brake_lockup":  15.0,
+    "brake_lockup": 15.0,
 }
 
 # ─── Mini-sector coaching ────────────────────────────────────────────────────────
@@ -933,6 +933,7 @@ _car_db: dict[str, dict] = {} # built at startup from AC's ui_car.json files
 # Crash & dirty move detection
 _prev_dmg_max     = 0.0        # max damage value from last frame
 _prev_position    = -1         # race position last frame (to detect sudden pos loss)
+_was_off_track    = False      # flanco: solo avisar al SALIR de pista, no mientras sigue afuera
 
 # Driver name registry: race_pos (int) → {name, first_name, car}
 _drivers: dict[int, dict] = {}
@@ -1712,7 +1713,7 @@ def _gap_seconds(t: Telemetry, car: dict) -> float:
 
 
 def _check_proactive_alerts():
-    global _prev_dmg_max, _prev_position, _crash_idx
+    global _prev_dmg_max, _prev_position, _crash_idx, _was_off_track
     with _lock:
         t    = _current
         laps = list(_lap_history)
@@ -1787,9 +1788,17 @@ def _check_proactive_alerts():
         if delta > RIVAL_CLOSE_LAP * 1000 and _can_alert("rival_close"):
             _say(f"Bajaste {delta/1000:.1f}s esta vuelta respecto a la anterior. Rival cerrando — revisa el ritmo.")
 
-    # ── Salida de pista — rule-based ────────────────────────────────────────────
-    if t.tyres_out >= OFF_TRACK_WHEELS_WARN and not t.in_pitlane and _can_alert("off_track"):
+    # ── Salida de pista — flanco, no cooldown puro ──────────────────────────────
+    # Solo avisa en la TRANSICIÓN a fuera de pista — sin esto, una excursión
+    # sostenida (o ruedas oscilando justo en el umbral al reincorporarse)
+    # repetía el aviso cada 12s durante la MISMA salida, lo cual se sentía
+    # incoherente con el aviso único del propio juego.
+    is_off_now = t.tyres_out >= OFF_TRACK_WHEELS_WARN and not t.in_pitlane
+    # cooldown como debounce extra: si tyres_out oscila justo en el umbral
+    # (ej. un piano/curb) no cuenta como una nueva salida cada vez.
+    if is_off_now and not _was_off_track and _can_alert("off_track", cd=3.0):
         _say("¡Fuera de pista, Julián! Cuidado al reincorporarte.", priority=1)
+    _was_off_track = is_off_now
 
     # ── Bloqueo de frenos — rule-based (primera pasada, ver umbral arriba) ──────
     if t.brake > LOCKUP_BRAKE_THRESHOLD:
@@ -2055,6 +2064,7 @@ def _handle_voice(wav_path: str):
         Path(wav_path).unlink(missing_ok=True)
         return
     try:
+        _t0 = time.time()
         print("[STT] Transcribiendo...", flush=True)
         text = _transcribe(wav_path)
         if not text or len(text.strip()) < 3:
@@ -2161,6 +2171,9 @@ def _handle_voice(wav_path: str):
             prompt = f"{ctx}\n\nPregunta libre del piloto: {text}"
 
         reply = _groq(prompt)
+        # Para poder diagnosticar reportes de "Victor se demora" sin adivinar:
+        # tiempo total desde que terminó de grabar hasta que hay respuesta lista.
+        print(f"[Piloto] respuesta lista en {time.time()-_t0:.2f}s (transcripción + LLM)")
         if reply:
             _say(reply)
 
