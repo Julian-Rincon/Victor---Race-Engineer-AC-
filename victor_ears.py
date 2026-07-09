@@ -42,7 +42,18 @@ class SileroVad:
 
     def __init__(self, model_path: Path | str):
         import onnxruntime as ort
-        self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        # Sin esto, ORT reparte cada inferencia (frame de 32ms) entre todos los
+        # cores lógicos y deja su pool de hilos "spin-waiting" entre llamadas —
+        # con el mic siempre activo eso satura la CPU de forma sostenida (~250-300%
+        # medido) y le roba ciclos a Wine/Proton mientras arranca Content Manager.
+        # El propio proyecto silero-vad fija 1 hilo en sus ejemplos por esta razón:
+        # el modelo es demasiado chico para beneficiarse de paralelismo.
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            str(model_path), sess_options=opts, providers=["CPUExecutionProvider"],
+        )
         self.reset()
 
     def reset(self) -> None:
