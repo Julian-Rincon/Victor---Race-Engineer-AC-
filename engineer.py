@@ -1632,6 +1632,9 @@ def _file_worker():
                             _reset_spotter()
 
             except Exception as e:
+                if isinstance(e, FileNotFoundError):
+                    time.sleep(0.04)
+                    continue
                 # No tragar errores en silencio: 1 log cada 30 s como máximo
                 if now_t - globals().get("_telem_err_t", 0.0) > 30.0:
                     globals()["_telem_err_t"] = now_t
