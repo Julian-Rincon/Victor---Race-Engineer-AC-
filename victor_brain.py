@@ -92,7 +92,7 @@ class VictorBrain:
         with self._lock:
             candidates = [b for b in self.backends if b.available()]
         for b in candidates:
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 reply = self._call_one(b, system, messages, max_tokens, timeout)
                 b.record_success()
@@ -101,10 +101,10 @@ class VictorBrain:
                 # más" reportado por el piloto, si fue un backend lento
                 # (Cerebras/NVIDIA/Gemini vs Groq) o el fallback saltando de
                 # uno a otro — solo se logueaban los fallos, nunca los éxitos.
-                print(f"[Brain] {b.name} respondió en {time.time()-t0:.2f}s")
+                print(f"[Brain] {b.name} respondió en {time.monotonic()-t0:.2f}s")
                 return reply
             except Exception as e:
-                print(f"[Brain:{b.name}] {e} (tras {time.time()-t0:.2f}s)")
+                print(f"[Brain:{b.name}] {e} (tras {time.monotonic()-t0:.2f}s)")
                 b.record_failure()
         self.last_backend = None
         return ""

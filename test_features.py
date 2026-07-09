@@ -157,7 +157,7 @@ eng._current.spline = 0.30
 with eng._deferred_lock:
     msgs = eng._deferred_msgs.copy()
     eng._deferred_msgs.clear()
-for pri, txt in msgs:
+for pri, txt, _queued_at in msgs:
     eng._tts_pq.put((pri, txt))
 check("Deferred se drena al salir de braking zone",
       any("diferido" in s[1] for s in spoken), f"spoken={[s[1] for s in spoken]}")

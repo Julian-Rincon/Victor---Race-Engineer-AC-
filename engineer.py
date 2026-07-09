@@ -934,6 +934,8 @@ _car_db: dict[str, dict] = {} # built at startup from AC's ui_car.json files
 _prev_dmg_max     = 0.0        # max damage value from last frame
 _prev_position    = -1         # race position last frame (to detect sudden pos loss)
 _was_off_track    = False      # flanco: solo avisar al SALIR de pista, no mientras sigue afuera
+_on_track_since   = 0.0        # timestamp: cuándo volvió a pista (histéresis anti-flicker)
+_OFF_TRACK_REARM_S = 0.5       # tiempo continuo en pista antes de poder re-disparar
 
 # Driver name registry: race_pos (int) → {name, first_name, car}
 _drivers: dict[int, dict] = {}
@@ -1193,12 +1195,26 @@ def _load_piper():
 
 _TTS_MARGIN_S = 5.0    # colchón por arranque de paplay/espeak-ng y overhead del pipeline de audio
 _TTS_MIN_TIMEOUT_S = 10.0
-_TTS_WORDS_PER_MINUTE = 158.0  # mismo valor que -s de espeak-ng, usado también para estimar Piper
+_TTS_MAX_TIMEOUT_S = 50.0  # ver _tts_timeout: techo para no bloquear indefinidamente la cola de TTS
+_ESPEAK_SPEED_WPM = 158  # -s de espeak-ng — fuente única, ver _speak_espeak y _tts_timeout
+
+
+def _tts_timeout(duration_s: float) -> float:
+    # El timeout fijo (antes 20s) cortaba a la mitad cualquier mensaje largo
+    # (un briefing típico son ~37s de audio real) y caía al fallback de
+    # espeak-ng — la "voz robot" reportada. El timeout ahora sigue la
+    # duración real (o estimada) del audio — pero con techo: _tts_worker es
+    # una sola cola secuencial, así que un mensaje sin límite podía bloquear
+    # una alerta prioridad=1 (salida de pista, bloqueo de frenos) encolada
+    # detrás durante todo lo que dure el mensaje largo. 50s cubre un
+    # briefing típico (~37s) con margen sin dejar la cola sin techo.
+    return min(_TTS_MAX_TIMEOUT_S, max(_TTS_MIN_TIMEOUT_S, duration_s + _TTS_MARGIN_S))
 
 
 def _speak_piper(text: str) -> bool:
     if _piper is None:
         return False
+    tmp = None
     try:
         chunks = list(_piper.synthesize(text))
         if not chunks:
@@ -1206,11 +1222,6 @@ def _speak_piper(text: str) -> bool:
         sample_rate = chunks[0].sample_rate
         total_samples = sum(len(c.audio_int16_bytes) // 2 for c in chunks)
         audio_duration_s = total_samples / sample_rate
-        # El timeout fijo (antes 20s) cortaba a la mitad cualquier mensaje largo
-        # (un briefing típico son ~37s de audio real) y caía al fallback de
-        # espeak-ng — la "voz robot" reportada. El timeout ahora sigue la
-        # duración real del audio sintetizado, no un tope arbitrario.
-        timeout = max(_TTS_MIN_TIMEOUT_S, audio_duration_s + _TTS_MARGIN_S)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
         with wave.open(tmp, "wb") as wf:
@@ -1220,12 +1231,17 @@ def _speak_piper(text: str) -> bool:
             for c in chunks:
                 wf.writeframes(c.audio_int16_bytes)
         import subprocess
-        subprocess.run(["paplay", tmp], capture_output=True, timeout=timeout)
-        Path(tmp).unlink(missing_ok=True)
+        subprocess.run(["paplay", tmp], capture_output=True, timeout=_tts_timeout(audio_duration_s))
         return True
     except Exception as e:
         print(f"[TTS piper] {e}")
         return False
+    finally:
+        # Si paplay cuelga/timeoutea, la excepción saltaba directo al except
+        # y este unlink (antes después del subprocess.run) nunca corría —
+        # quedaba un .wav huérfano en /tmp por cada fallo, para siempre.
+        if tmp:
+            Path(tmp).unlink(missing_ok=True)
 
 
 def _speak_espeak(text: str):
@@ -1233,13 +1249,12 @@ def _speak_espeak(text: str):
     # Mismo problema que Piper: sin estimar duración, un timeout fijo corta
     # mensajes largos a la mitad. espeak-ng no expone la duración de antemano
     # (sintetiza y reproduce en el mismo paso), así que se estima por
-    # cantidad de palabras a la velocidad configurada (-s 158 wpm).
+    # cantidad de palabras a la velocidad configurada.
     words = len(text.split())
-    est_duration_s = words / (_TTS_WORDS_PER_MINUTE / 60.0)
-    timeout = max(_TTS_MIN_TIMEOUT_S, est_duration_s + _TTS_MARGIN_S)
+    est_duration_s = words / (_ESPEAK_SPEED_WPM / 60.0)
     try:
-        subprocess.run(["espeak-ng", "-v", "es-419", "-s", "158", "-a", "180", text],
-                       capture_output=True, timeout=timeout)
+        subprocess.run(["espeak-ng", "-v", "es-419", "-s", str(_ESPEAK_SPEED_WPM), "-a", "180", text],
+                       capture_output=True, timeout=_tts_timeout(est_duration_s))
     except Exception as e:
         print(f"[TTS espeak] {e}")
 
@@ -1490,7 +1505,7 @@ def _reset_zone_state():
 
 def _file_worker():
     global _connected, _current, _race_started, _audio_check_done, _pre_race_done, _last_session, \
-           _zone_current, _zone_entry_t
+           _zone_current, _zone_entry_t, _was_off_track, _on_track_since, _prev_dmg_max, _prev_position
 
     # Auto-detect source: SHM reader (/tmp/) preferred, bridge (ACEngineer dir) as fallback
     def _pick_source():
@@ -1565,6 +1580,16 @@ def _file_worker():
                             _reset_zone_state()
                             with _alert_times_lock:
                                 _alert_times.clear()
+                            # Sin esto, un flag de excursión/daño/posición de la
+                            # sesión ANTERIOR sobrevivía al cambio — ej. terminar
+                            # una sesión fuera de pista dejaba _was_off_track=True,
+                            # y si la sesión nueva arrancaba también fuera de pista
+                            # (reinicio en el mismo lugar), esa excursión real
+                            # quedaba sin avisar por creer que ya se había avisado.
+                            _was_off_track  = False
+                            _on_track_since = 0.0
+                            _prev_dmg_max   = 0.0
+                            _prev_position  = -1
                             print(f"[Telem] Nueva sesión: {_session_name(new_session)} — estado reiniciado.")
                         _last_session = new_session
             except Exception:
@@ -1676,17 +1701,23 @@ def _file_worker():
 
                         if _is_live(cur):
                             _run_spotter(cur)
+                            _check_fast_alerts(cur, src_name)
                         else:
                             _reset_spotter()
 
             except Exception as e:
-                if isinstance(e, FileNotFoundError):
-                    time.sleep(0.04)
-                    continue
-                # No tragar errores en silencio: 1 log cada 30 s como máximo
-                if now_t - globals().get("_telem_err_t", 0.0) > 30.0:
-                    globals()["_telem_err_t"] = now_t
-                    print(f"[Telem] ERROR procesando paquete: {type(e).__name__}: {e}")
+                # FileNotFoundError es transitorio (rename atómico del SHM reader) y
+                # no se loguea — pero antes esto hacía `continue`, saltándose el
+                # bloque de detección de timeout de más abajo. Si el archivo
+                # desaparecía y NUNCA volvía (ej. ac_shm_reader.exe crasheó), cada
+                # iteración volvía a caer en FileNotFoundError y _connected se
+                # quedaba en True para siempre — el reset de desconexión nunca
+                # corría. Ahora solo se omite el log; el timeout sigue evaluándose.
+                if not isinstance(e, FileNotFoundError):
+                    # No tragar errores en silencio: 1 log cada 30 s como máximo
+                    if now_t - globals().get("_telem_err_t", 0.0) > 30.0:
+                        globals()["_telem_err_t"] = now_t
+                        print(f"[Telem] ERROR procesando paquete: {type(e).__name__}: {e}")
 
             # Timeout detection — file hasn't updated in TIMEOUT_SECS
             if _connected and was_connected and last_fast_mtime > 0:
@@ -1720,8 +1751,60 @@ def _gap_seconds(t: Telemetry, car: dict) -> float:
     return abs(diff) * t.track_len / avg
 
 
+_bridge_limitation_warned = False
+
+
+def _check_fast_alerts(t: Telemetry, src_name: str):
+    """Detección de eventos cortos (bloqueo de frenos, salida de pista) que
+    necesitan muestrearse en el loop rápido de telemetría (~40ms) — llamarlas
+    desde _check_proactive_alerts (cada 6s) las perdía casi siempre: un
+    bloqueo de frenos dura bien menos de un segundo."""
+    global _was_off_track, _on_track_since, _bridge_limitation_warned
+    if t.lap < 1 or t.speed < 2:
+        return
+
+    # El bridge (widget Python dentro de AC, fallback cuando el lector SHM no
+    # está disponible) no expone numberOfTyresOut/brake/wheelSlip por su API
+    # — tyres_out/brake/slip_* quedan siempre en 0 ahí, así que salida de
+    # pista y bloqueo de frenos no son detectables en ese modo. Antes fallaba
+    # en silencio (nunca disparaba, sin avisar que la cobertura era parcial).
+    if src_name != "SHM":
+        if not _bridge_limitation_warned:
+            print("[Fast-alerts] Modo Bridge activo — salida de pista y "
+                  "bloqueo de frenos no se detectan en este modo (requiere SHM).")
+            _bridge_limitation_warned = True
+        return
+
+    # Salida de pista — flanco con histéresis, no cooldown compartido. Corre
+    # en el loop rápido (~40ms) para no perderse excursiones cortas, así que
+    # ruedas oscilando justo en el umbral (piano/curb) sí pueden flickear
+    # varias veces por segundo — exige _OFF_TRACK_REARM_S de pista continua
+    # antes de poder re-disparar, en vez de re-armar en el primer tick "on
+    # track" (que dispararía de nuevo con el próximo micro-flicker).
+    is_off_now = t.tyres_out >= OFF_TRACK_WHEELS_WARN and not t.in_pitlane
+    now = time.time()
+    if is_off_now:
+        if not _was_off_track:
+            _say("¡Fuera de pista, Julián! Cuidado al reincorporarte.", priority=1)
+            _was_off_track = True
+        _on_track_since = 0.0
+    elif _was_off_track:
+        if _on_track_since == 0.0:
+            _on_track_since = now
+        elif now - _on_track_since >= _OFF_TRACK_REARM_S:
+            _was_off_track = False
+
+    # Bloqueo de frenos — rule-based (primera pasada, ver umbral arriba).
+    if t.brake > LOCKUP_BRAKE_THRESHOLD:
+        slips = {"delantera izq": t.slip_fl, "delantera der": t.slip_fr,
+                 "trasera izq": t.slip_rl,   "trasera der": t.slip_rr}
+        wheel, worst_slip = max(slips.items(), key=lambda kv: kv[1])
+        if worst_slip > LOCKUP_SLIP_THRESHOLD and _can_alert("brake_lockup"):
+            _say(f"Bloqueo en la rueda {wheel} — suelta un poco el freno antes de girar.", priority=1)
+
+
 def _check_proactive_alerts():
-    global _prev_dmg_max, _prev_position, _crash_idx, _was_off_track
+    global _prev_dmg_max, _prev_position, _crash_idx
     with _lock:
         t    = _current
         laps = list(_lap_history)
@@ -1795,26 +1878,6 @@ def _check_proactive_alerts():
         delta = laps[-1].time_ms - laps[-2].time_ms
         if delta > RIVAL_CLOSE_LAP * 1000 and _can_alert("rival_close"):
             _say(f"Bajaste {delta/1000:.1f}s esta vuelta respecto a la anterior. Rival cerrando — revisa el ritmo.")
-
-    # ── Salida de pista — flanco, no cooldown puro ──────────────────────────────
-    # Solo avisa en la TRANSICIÓN a fuera de pista — sin esto, una excursión
-    # sostenida (o ruedas oscilando justo en el umbral al reincorporarse)
-    # repetía el aviso cada 12s durante la MISMA salida, lo cual se sentía
-    # incoherente con el aviso único del propio juego.
-    is_off_now = t.tyres_out >= OFF_TRACK_WHEELS_WARN and not t.in_pitlane
-    # cooldown como debounce extra: si tyres_out oscila justo en el umbral
-    # (ej. un piano/curb) no cuenta como una nueva salida cada vez.
-    if is_off_now and not _was_off_track and _can_alert("off_track", cd=3.0):
-        _say("¡Fuera de pista, Julián! Cuidado al reincorporarte.", priority=1)
-    _was_off_track = is_off_now
-
-    # ── Bloqueo de frenos — rule-based (primera pasada, ver umbral arriba) ──────
-    if t.brake > LOCKUP_BRAKE_THRESHOLD:
-        slips = {"delantera izq": t.slip_fl, "delantera der": t.slip_fr,
-                 "trasera izq": t.slip_rl,   "trasera der": t.slip_rr}
-        wheel, worst_slip = max(slips.items(), key=lambda kv: kv[1])
-        if worst_slip > LOCKUP_SLIP_THRESHOLD and _can_alert("brake_lockup"):
-            _say(f"Bloqueo en la rueda {wheel} — suelta un poco el freno antes de girar.", priority=1)
 
     # ── Pit window — rule-based ─────────────────────────────────────────────────
     _check_pit_window(t, laps)
@@ -2072,7 +2135,7 @@ def _handle_voice(wav_path: str):
         Path(wav_path).unlink(missing_ok=True)
         return
     try:
-        _t0 = time.time()
+        _t0 = time.monotonic()
         print("[STT] Transcribiendo...", flush=True)
         text = _transcribe(wav_path)
         if not text or len(text.strip()) < 3:
@@ -2082,6 +2145,12 @@ def _handle_voice(wav_path: str):
         has_wake, text = victor_wake.has_wake_word(text)
         if not has_wake:
             print(f"[STT] Sin 'Victor' — ignorado: '{text}'")
+            return
+        if len(text.strip()) < 3:
+            # Solo dijo "Victor" (o algo casi vacío después de sacar el wake
+            # word) — sin esto caía al prompt "libre" con una pregunta en
+            # blanco, gastando una llamada al LLM para nada.
+            print("[STT] Solo 'Victor' — sin comando, ignorado.")
             return
 
         print(f"[Piloto] {text}")
@@ -2181,7 +2250,7 @@ def _handle_voice(wav_path: str):
         reply = _groq(prompt)
         # Para poder diagnosticar reportes de "Victor se demora" sin adivinar:
         # tiempo total desde que terminó de grabar hasta que hay respuesta lista.
-        print(f"[Piloto] respuesta lista en {time.time()-_t0:.2f}s (transcripción + LLM)")
+        print(f"[Piloto] respuesta lista en {time.monotonic()-_t0:.2f}s (transcripción + LLM)")
         if reply:
             _say(reply)
 

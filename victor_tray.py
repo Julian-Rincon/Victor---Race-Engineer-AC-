@@ -39,14 +39,28 @@ def _is_running() -> bool:
         return False
 
 def _is_ac_connected() -> bool:
-    """True si el log muestra que AC está enviando datos (modificado en los últimos 15s)."""
+    """True si el log muestra que AC está enviando datos (modificado en los últimos 15s).
+
+    Lee solo el final del archivo (seek desde el final) en vez de cargarlo
+    entero — engineer.py corre horas seguidas durante una sesión y este
+    chequeo se llama cada 4s, así que un read_text() completo se vuelve más
+    caro cuanto más dura la sesión. Los strings buscados también estaban
+    desactualizados ("[UDP] ...") — el log real dice "[Telem] AC conectado
+    via {fuente}." / "[Telem] Sin señal AC (timeout)...", así que esta
+    función nunca detectaba una conexión real.
+    """
     try:
         if not LOG_FILE.exists():
             return False
         if time.time() - LOG_FILE.stat().st_mtime > 20:
             return False
-        tail = LOG_FILE.read_text()[-3000:]
-        return "[UDP] AC conectado" in tail and "[UDP] Sin señal" not in tail.split("[UDP] AC conectado")[-1]
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 3000))
+            tail = f.read().decode("utf-8", errors="ignore")
+        return ("[Telem] AC conectado" in tail
+                and "[Telem] Sin señal" not in tail.split("[Telem] AC conectado")[-1])
     except Exception:
         return False
 

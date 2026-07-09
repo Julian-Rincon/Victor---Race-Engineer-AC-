@@ -32,8 +32,17 @@ PROTON_DIR="$(_resolve_proton_dir || true)"
 AC_PROTON="${PROTON_DIR:+$PROTON_DIR/proton}"
 
 _spawn_detached() {
+  # --fork fuerza que setsid siempre bifurque un hijo nuevo. Sin esto, si
+  # quien invoca este script tiene control de trabajos activo (`set -m`,
+  # ej. una shell interactiva), setsid bifurca IGUAL por su cuenta pero el
+  # PID que queda en "$!" es el del proceso padre que termina casi al
+  # instante — el proceso real sigue vivo con un PID nunca registrado en el
+  # PID file, y _stop_tracked no lo puede matar ni encontrar (kill -0
+  # falla, y como el PID file SÍ existe tampoco cae al fallback por
+  # nombre). --fork deja el comportamiento igual sin importar el contexto
+  # de quien llama.
   if command -v setsid >/dev/null 2>&1; then
-    exec setsid "$@"
+    exec setsid --fork "$@"
   else
     exec nohup "$@"
   fi
@@ -52,7 +61,7 @@ _stop_tracked() {
     local pid
     pid="$(cat "$pidfile" 2>/dev/null || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null && echo "[Victor] $label detenido (PID $pid)."
+      kill "$pid" 2>/dev/null && echo "[Victor] $label detenido (PID $pid)." || true
     fi
     rm -f "$pidfile"
   elif pkill -f "$pattern" 2>/dev/null; then
