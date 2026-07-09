@@ -91,6 +91,15 @@ SPOTTER_CONFIRM_S      = 0.15  # confirmación antes de anunciar (anti-jitter)
 SPOTTER_CLEAR_S        = 0.8   # retardo antes de cantar "despejado"
 
 # Alert thresholds
+# Bloqueo de frenos: umbrales de primera pasada, sin calibrar con datos reales
+# todavía (a diferencia del VAD, que sí tiene tools/teach_victor.py). wheelSlip
+# de AC ronda 1-4 bajo agarre normal en frenada fuerte; bloqueo sostenido lo
+# dispara mucho más alto porque la rueda deja de rodar mientras el auto sigue
+# a velocidad. Ajustar si da falsos positivos/negativos en pista real.
+LOCKUP_SLIP_THRESHOLD  = 6.0
+LOCKUP_BRAKE_THRESHOLD = 0.3
+OFF_TRACK_WHEELS_WARN  = 2  # de 4 ruedas fuera de pista
+
 FUEL_LAPS_WARN   = 3.5
 FUEL_LAPS_CRIT   = 1.8
 TYRE_TEMP_WARN   = 95.0
@@ -128,6 +137,7 @@ COOLDOWN: dict[str, float] = {
     "pit_window":   60.0, "session_brief": 999.0,
     "coaching":     60.0, "crash_reaction": 8.0,
     "dirty_move":   15.0, "midlap_proj":   35.0,
+    "off_track":    12.0, "brake_lockup":  15.0,
 }
 
 # ─── Mini-sector coaching ────────────────────────────────────────────────────────
@@ -797,6 +807,10 @@ class Telemetry:
     sector_index: int = 0
     last_sector_ms: int = 0
     in_pitlane: bool = False
+    tyres_out: int = 0
+    brake: float = 0.0
+    slip_fl: float = 0.0; slip_fr: float = 0.0
+    slip_rl: float = 0.0; slip_rr: float = 0.0
 
 @dataclass
 class LapRecord:
@@ -1168,6 +1182,11 @@ def _load_piper():
         print(f"[TTS] piper falló: {e}")
 
 
+_TTS_MARGIN_S = 5.0    # colchón por arranque de paplay/espeak-ng y overhead del pipeline de audio
+_TTS_MIN_TIMEOUT_S = 10.0
+_TTS_WORDS_PER_MINUTE = 158.0  # mismo valor que -s de espeak-ng, usado también para estimar Piper
+
+
 def _speak_piper(text: str) -> bool:
     if _piper is None:
         return False
@@ -1175,16 +1194,24 @@ def _speak_piper(text: str) -> bool:
         chunks = list(_piper.synthesize(text))
         if not chunks:
             return False
+        sample_rate = chunks[0].sample_rate
+        total_samples = sum(len(c.audio_int16_bytes) // 2 for c in chunks)
+        audio_duration_s = total_samples / sample_rate
+        # El timeout fijo (antes 20s) cortaba a la mitad cualquier mensaje largo
+        # (un briefing típico son ~37s de audio real) y caía al fallback de
+        # espeak-ng — la "voz robot" reportada. El timeout ahora sigue la
+        # duración real del audio sintetizado, no un tope arbitrario.
+        timeout = max(_TTS_MIN_TIMEOUT_S, audio_duration_s + _TTS_MARGIN_S)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
         with wave.open(tmp, "wb") as wf:
             wf.setnchannels(chunks[0].sample_channels)
             wf.setsampwidth(chunks[0].sample_width)
-            wf.setframerate(chunks[0].sample_rate)
+            wf.setframerate(sample_rate)
             for c in chunks:
                 wf.writeframes(c.audio_int16_bytes)
         import subprocess
-        subprocess.run(["paplay", tmp], capture_output=True, timeout=20)
+        subprocess.run(["paplay", tmp], capture_output=True, timeout=timeout)
         Path(tmp).unlink(missing_ok=True)
         return True
     except Exception as e:
@@ -1194,9 +1221,16 @@ def _speak_piper(text: str) -> bool:
 
 def _speak_espeak(text: str):
     import subprocess
+    # Mismo problema que Piper: sin estimar duración, un timeout fijo corta
+    # mensajes largos a la mitad. espeak-ng no expone la duración de antemano
+    # (sintetiza y reproduce en el mismo paso), así que se estima por
+    # cantidad de palabras a la velocidad configurada (-s 158 wpm).
+    words = len(text.split())
+    est_duration_s = words / (_TTS_WORDS_PER_MINUTE / 60.0)
+    timeout = max(_TTS_MIN_TIMEOUT_S, est_duration_s + _TTS_MARGIN_S)
     try:
         subprocess.run(["espeak-ng", "-v", "es-419", "-s", "158", "-a", "180", text],
-                       capture_output=True, timeout=20)
+                       capture_output=True, timeout=timeout)
     except Exception as e:
         print(f"[TTS espeak] {e}")
 
@@ -1579,6 +1613,10 @@ def _file_worker():
                                 cars_data=p.get("cars_data", []),
                                 time_left=_current.time_left,
                                 updated=time.time(),
+                                tyres_out=p.get("tyres_out", 0),
+                                brake=p.get("brake", 0.0),
+                                slip_fl=p.get("slip_fl", 0.0), slip_fr=p.get("slip_fr", 0.0),
+                                slip_rl=p.get("slip_rl", 0.0), slip_rr=p.get("slip_rr", 0.0),
                             )
                             cur = _current
                             cur_lap = cur.lap
@@ -1748,6 +1786,18 @@ def _check_proactive_alerts():
         delta = laps[-1].time_ms - laps[-2].time_ms
         if delta > RIVAL_CLOSE_LAP * 1000 and _can_alert("rival_close"):
             _say(f"Bajaste {delta/1000:.1f}s esta vuelta respecto a la anterior. Rival cerrando — revisa el ritmo.")
+
+    # ── Salida de pista — rule-based ────────────────────────────────────────────
+    if t.tyres_out >= OFF_TRACK_WHEELS_WARN and not t.in_pitlane and _can_alert("off_track"):
+        _say("¡Fuera de pista, Julián! Cuidado al reincorporarte.", priority=1)
+
+    # ── Bloqueo de frenos — rule-based (primera pasada, ver umbral arriba) ──────
+    if t.brake > LOCKUP_BRAKE_THRESHOLD:
+        slips = {"delantera izq": t.slip_fl, "delantera der": t.slip_fr,
+                 "trasera izq": t.slip_rl,   "trasera der": t.slip_rr}
+        wheel, worst_slip = max(slips.items(), key=lambda kv: kv[1])
+        if worst_slip > LOCKUP_SLIP_THRESHOLD and _can_alert("brake_lockup"):
+            _say(f"Bloqueo en la rueda {wheel} — suelta un poco el freno antes de girar.", priority=1)
 
     # ── Pit window — rule-based ─────────────────────────────────────────────────
     _check_pit_window(t, laps)

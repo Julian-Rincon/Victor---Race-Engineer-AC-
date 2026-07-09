@@ -285,6 +285,12 @@ static void write_fast(void) {
     jf("\"dmg_left\":%.1f,",   phy->carDamage[2]);
     jf("\"dmg_right\":%.1f,",  phy->carDamage[3]);
     jf("\"dmg_centre\":%.1f,", phy->carDamage[4]);
+    jf("\"tyres_out\":%d,",    phy->numberOfTyresOut);
+    jf("\"brake\":%.3f,",      phy->brake);
+    jf("\"slip_fl\":%.2f,",    phy->wheelSlip[0]);
+    jf("\"slip_fr\":%.2f,",    phy->wheelSlip[1]);
+    jf("\"slip_rl\":%.2f,",    phy->wheelSlip[2]);
+    jf("\"slip_rr\":%.2f,",    phy->wheelSlip[3]);
 
     /* Nearby cars — only if crewchief SHM is available */
     jb("\"cars_data\":[");
