@@ -6,3 +6,5 @@ nohup.out
 voices/
 models/
 data/
+.pytest_cache/
+.impeccable/

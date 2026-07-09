@@ -1,0 +1,13 @@
+# Core: telemetría, LLM, TTS, VAD
+numpy
+requests
+onnxruntime
+piper-tts
+scipy
+
+# Bandeja del sistema (opcional — start.sh tray)
+pystray
+pillow
+
+# Tests
+pytest
