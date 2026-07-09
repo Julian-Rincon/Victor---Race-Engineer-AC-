@@ -43,6 +43,7 @@ import victor_brain
 import victor_config as cfg
 import victor_ears
 import victor_memory
+import victor_wake
 
 # ─── Configuration ──────────────────────────────────────────────────────────────
 
@@ -2008,6 +2009,11 @@ def _handle_voice(wav_path: str):
         text = _transcribe(wav_path)
         if not text or len(text.strip()) < 3:
             print("[STT] Sin voz reconocible.")
+            return
+
+        has_wake, text = victor_wake.has_wake_word(text)
+        if not has_wake:
+            print(f"[STT] Sin 'Victor' — ignorado: '{text}'")
             return
 
         print(f"[Piloto] {text}")
