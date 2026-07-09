@@ -952,8 +952,16 @@ _last_zone_deltas: list[tuple[float, int]] = []             # (delta_s, zone_idx
 _gap_snapshots:   dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
 _gap_snaps_lock   = threading.Lock()
 
-# Deferred messages (non-critical TTS queued during braking zones)
-_deferred_msgs:   list[tuple[int, str]] = []
+# Deferred messages (non-critical TTS queued during braking zones).
+# Vencen a los _DEFERRED_STALE_S: sin esto, un mensaje de "bajaste tiempo" o
+# similar podía quedar pospuesto hasta la próxima vez que el piloto estuviera
+# fuera de TODAS las zonas de frenada mapeadas de la pista — que tras un
+# trompo/salida de pista (donde se entra y sale de zonas de frenada
+# seguido mientras se recupera) podía ser mucho después del evento que lo
+# disparó, y llegaba desconectado de contexto (reportado en vivo: "nunca
+# escuché que dijera eso").
+_DEFERRED_STALE_S = 10.0
+_deferred_msgs:   list[tuple[int, str, float]] = []   # (priority, text, queued_at)
 _deferred_lock    = threading.Lock()
 
 # Crash reaction templates — rotate to avoid repetition
@@ -1295,7 +1303,7 @@ def _say(text: str, priority: int = 2):
         return
     if priority >= 2 and _in_braking_zone():
         with _deferred_lock:
-            _deferred_msgs.append((priority, text.strip()))
+            _deferred_msgs.append((priority, text.strip(), time.time()))
         return
     _tts_pq.put((priority, text.strip()))
 
@@ -2437,14 +2445,20 @@ def main():
                     target=_post_race_debrief, args=(t, laps_snap), daemon=True
                 ).start()
 
-            # Drain deferred messages when clear of braking zone
+            # Drain deferred messages when clear of braking zone — descarta
+            # las que ya vencieron (ver _DEFERRED_STALE_S) en vez de hablar
+            # algo desconectado del momento que lo disparó.
             if not _in_braking_zone():
                 with _deferred_lock:
                     if _deferred_msgs:
                         msgs = _deferred_msgs.copy()
                         _deferred_msgs.clear()
-                        for pri, txt in msgs:
-                            _tts_pq.put((pri, txt))
+                        now_drain = time.time()
+                        for pri, txt, queued_at in msgs:
+                            if now_drain - queued_at <= _DEFERRED_STALE_S:
+                                _tts_pq.put((pri, txt))
+                            else:
+                                print(f"[TTS] Mensaje diferido descartado (venció): '{txt}'")
 
             # Proactive alerts every 6 s (solo con el juego en pista)
             now = time.time()
