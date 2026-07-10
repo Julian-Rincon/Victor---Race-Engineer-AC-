@@ -937,6 +937,13 @@ _was_off_track    = False      # flanco: solo avisar al SALIR de pista, no mient
 _on_track_since   = 0.0        # timestamp: cuándo volvió a pista (histéresis anti-flicker)
 _OFF_TRACK_REARM_S = 0.5       # tiempo continuo en pista antes de poder re-disparar
 
+# Contadores de patrones de manejo de LA SESIÓN ACTUAL — se acumulan mientras
+# corre la sesión y se vuelcan a victor_memory.record_session_patterns() al
+# cambiar de sesión (ver _file_worker), después se resetean a 0.
+_session_off_track_count = 0
+_session_lockup_count    = 0
+_session_crash_count     = 0
+
 # Driver name registry: race_pos (int) → {name, first_name, car}
 _drivers: dict[int, dict] = {}
 _drivers_lock = threading.Lock()
@@ -1505,7 +1512,8 @@ def _reset_zone_state():
 
 def _file_worker():
     global _connected, _current, _race_started, _audio_check_done, _pre_race_done, _last_session, \
-           _zone_current, _zone_entry_t, _was_off_track, _on_track_since, _prev_dmg_max, _prev_position
+           _zone_current, _zone_entry_t, _was_off_track, _on_track_since, _prev_dmg_max, _prev_position, \
+           _session_off_track_count, _session_lockup_count, _session_crash_count
 
     # Auto-detect source: SHM reader (/tmp/) preferred, bridge (ACEngineer dir) as fallback
     def _pick_source():
@@ -1548,6 +1556,15 @@ def _file_worker():
                     p = _read_json_file(slow_path)
                     if p and p.get("t") == "slow":
                         with _lock:
+                            # Capturados ANTES de sobreescribir con el nuevo track/car
+                            # de abajo — si no, para cuando se detecta el cambio de
+                            # sesión más adelante, _current.track/car ya son los de
+                            # la sesión NUEVA y record_session_patterns guardaría los
+                            # patrones de la sesión que termina bajo la llave (pista,
+                            # coche) equivocada.
+                            ending_track = _current.track
+                            ending_car   = _current.car
+                            ending_laps  = _current.lap
                             new_session = p.get("session", _current.session)
                             _current.session   = new_session
                             _current.time_left = p.get("time_left", _current.time_left)
@@ -1571,6 +1588,21 @@ def _file_worker():
                                         }
 
                         if new_session != _last_session and new_session >= 0:
+                            # Guarda los patrones de manejo de la sesión que TERMINA
+                            # (pista/coche/vueltas capturados arriba, antes de que se
+                            # sobreescribieran) — a diferencia de record_debrief (solo
+                            # al final de una carrera), esto corre en CUALQUIER cambio
+                            # de sesión, así que práctica/hotlap también aportan.
+                            if ending_track and ending_car:
+                                victor_memory.record_session_patterns(
+                                    ending_track, ending_car, laps=ending_laps,
+                                    off_track_count=_session_off_track_count,
+                                    brake_lockup_count=_session_lockup_count,
+                                    crash_count=_session_crash_count,
+                                )
+                            _session_off_track_count = 0
+                            _session_lockup_count    = 0
+                            _session_crash_count     = 0
                             # Any session change: reset state
                             _pre_race_done    = False
                             _race_started     = False
@@ -1759,7 +1791,8 @@ def _check_fast_alerts(t: Telemetry, src_name: str):
     necesitan muestrearse en el loop rápido de telemetría (~40ms) — llamarlas
     desde _check_proactive_alerts (cada 6s) las perdía casi siempre: un
     bloqueo de frenos dura bien menos de un segundo."""
-    global _was_off_track, _on_track_since, _bridge_limitation_warned
+    global _was_off_track, _on_track_since, _bridge_limitation_warned, \
+           _session_off_track_count, _session_lockup_count
     if t.lap < 1 or t.speed < 2:
         return
 
@@ -1787,6 +1820,7 @@ def _check_fast_alerts(t: Telemetry, src_name: str):
         if not _was_off_track:
             _say("¡Fuera de pista, Julián! Cuidado al reincorporarte.", priority=1)
             _was_off_track = True
+            _session_off_track_count += 1
         _on_track_since = 0.0
     elif _was_off_track:
         if _on_track_since == 0.0:
@@ -1801,10 +1835,11 @@ def _check_fast_alerts(t: Telemetry, src_name: str):
         wheel, worst_slip = max(slips.items(), key=lambda kv: kv[1])
         if worst_slip > LOCKUP_SLIP_THRESHOLD and _can_alert("brake_lockup"):
             _say(f"Bloqueo en la rueda {wheel} — suelta un poco el freno antes de girar.", priority=1)
+            _session_lockup_count += 1
 
 
 def _check_proactive_alerts():
-    global _prev_dmg_max, _prev_position, _crash_idx
+    global _prev_dmg_max, _prev_position, _crash_idx, _session_crash_count
     with _lock:
         t    = _current
         laps = list(_lap_history)
@@ -1853,6 +1888,7 @@ def _check_proactive_alerts():
         if t.dmg_right  > 5: parts.append(f"derecha {t.dmg_right:.0f}%")
         tmpl = _CRASH_TEMPLATES[_crash_idx % len(_CRASH_TEMPLATES)]
         _crash_idx += 1
+        _session_crash_count += 1
         desc = ', '.join(parts) or 'general'
         _say(f"{tmpl} {desc}. ¿Cómo responde el coche, Julián?", priority=1)
     elif max_dmg > DAMAGE_WARN and _can_alert("damage"):

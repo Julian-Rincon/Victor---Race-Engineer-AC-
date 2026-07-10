@@ -49,6 +49,31 @@ def record_debrief(track: str, car: str, *, best_lap_ms: float,
     save(mem)
 
 
+def record_session_patterns(track: str, car: str, *, laps: int,
+                             off_track_count: int = 0,
+                             brake_lockup_count: int = 0,
+                             crash_count: int = 0) -> None:
+    """Guarda patrones de manejo de ESTA sesión (salidas de pista, bloqueos de
+    freno, choques) — a diferencia de record_debrief, se llama al terminar
+    CUALQUIER sesión con vueltas reales (práctica, hotlap, carrera), no solo
+    al final de una carrera. Guarda un rolling de las últimas 5 sesiones por
+    combinación pista+coche; context_block() promedia sobre esas para avisar
+    de patrones recurrentes sin reaccionar a una sola sesión rara."""
+    if laps <= 0:
+        return
+    mem = load()
+    key = _key(track, car)
+    entry = mem.get(key, {})
+    sessions = entry.get("recent_sessions", [])
+    sessions.append({
+        "laps": laps, "off_track": off_track_count,
+        "lockups": brake_lockup_count, "crashes": crash_count,
+    })
+    entry["recent_sessions"] = sessions[-5:]
+    mem[key] = entry
+    save(mem)
+
+
 def context_block(track: str, car: str) -> str:
     """Bloque de texto para inyectar en el prompt de briefing de sesión. Vacío si
     no hay historial para esta combinación pista+coche."""
@@ -64,4 +89,23 @@ def context_block(track: str, car: str) -> str:
         lines.append(f"  Zonas donde suele perder tiempo: {', '.join(zones)}")
     if entry.get("last_debrief_note"):
         lines.append(f"  Nota del último debrief: {entry['last_debrief_note']}")
+
+    sessions = entry.get("recent_sessions", [])
+    if sessions:
+        n = len(sessions)
+        avg_off  = sum(s.get("off_track", 0) for s in sessions) / n
+        avg_lock = sum(s.get("lockups", 0)   for s in sessions) / n
+        avg_crash = sum(s.get("crashes", 0)  for s in sessions) / n
+        # Umbral 0.5: solo menciona un patrón si pasa "casi cada sesión en
+        # promedio" — un solo incidente en 5 sesiones no cuenta como patrón,
+        # evita ruido para un piloto que en general maneja limpio.
+        parts = []
+        if avg_off >= 0.5:
+            parts.append(f"~{avg_off:.1f} salidas de pista por sesión")
+        if avg_lock >= 0.5:
+            parts.append(f"~{avg_lock:.1f} bloqueos de freno por sesión")
+        if avg_crash >= 0.5:
+            parts.append(f"~{avg_crash:.1f} choques por sesión")
+        if parts:
+            lines.append(f"  Patrón reciente ({n} sesiones): {', '.join(parts)}.")
     return "\n".join(lines)
